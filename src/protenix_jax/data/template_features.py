@@ -358,11 +358,18 @@ def assemble_template_features(
     """Concatenate per-chain dense features over residues, derive 2D features.
 
     ``chain_dense`` items are ``(aatype, atom_positions, atom_mask)`` each
-    ``(MAX_TEMPLATES, num_res, ...)``. Returns ``None`` if every chain is an
-    empty placeholder (no real templates -> behave as no-template input).
+    ``(MAX_TEMPLATES, num_res, ...)``. Returns ``None`` only when no chains are
+    present. When chains exist but carry no real templates, torch still embeds
+    a single fully-masked gap template (see ``make_dummy_feature`` /
+    ``empty_template_features``): ``template_aatype`` slot 0 = gap (31), the
+    remaining slots zero-padded, all 2D features zero. The trunk
+    ``TemplateEmbedder`` runs over these and its ``linear_no_bias_z(z_norm)``
+    path contributes a dense, non-trivial delta to ``z``. Returning ``None``
+    here drops that contribution and diverges from torch, so the dummy
+    placeholder must be emitted rather than skipped.
     """
 
-    if not chain_dense or all(not c[1].any() for c in chain_dense):
+    if not chain_dense:
         return None
     aatype = np.concatenate([c[0] for c in chain_dense], axis=1)
     atom_positions = np.concatenate([c[1] for c in chain_dense], axis=1)

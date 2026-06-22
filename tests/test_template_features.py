@@ -65,7 +65,12 @@ def test_template_features_match_torch_golden() -> None:
     assert features["template_unit_vector"].shape == (4, 5, 5, 3)
 
 
-def test_template_features_absent_without_templates() -> None:
+def test_dummy_template_emitted_without_templates() -> None:
+    # torch always embeds a single fully-masked gap template when none is
+    # provided (make_dummy_feature / empty_template_features): aatype slot 0 is
+    # the gap residue (31), remaining slots zero-padded, all 2D features zero.
+    # The trunk TemplateEmbedder runs over these, so the features must be
+    # present (a previous return-None skip diverged from torch by ~128 in z).
     job = {
         "name": "no_tpl",
         "sequences": [
@@ -74,12 +79,18 @@ def test_template_features_absent_without_templates() -> None:
     }
     features = featurize_protein_json(job)
     for key in _TEMPLATE_KEYS:
-        assert key not in features
+        assert key in features, key
+    aatype = np.asarray(features["template_aatype"])
+    assert aatype.shape == (4, 5)
+    assert (aatype[0] == 31).all()  # gap template
+    assert (aatype[1:] == 0).all()  # zero padding
+    for key in ("template_distogram", "template_unit_vector"):
+        assert not np.asarray(features[key]).any()
 
 
-def test_template_short_chain_skipped() -> None:
-    # Length <= 4 protein chains are skipped (torch behaviour); since the only
-    # chain is skipped, no real templates remain -> features omitted.
+def test_template_short_chain_skipped_emits_dummy() -> None:
+    # Length <= 4 protein chains are skipped, so no real template remains; torch
+    # still emits the single fully-masked gap template placeholder.
     job = {
         "name": "short",
         "sequences": [
@@ -93,7 +104,9 @@ def test_template_short_chain_skipped() -> None:
         ],
     }
     features = featurize_protein_json(job)
-    assert "template_aatype" not in features
+    aatype = np.asarray(features["template_aatype"])
+    assert aatype.shape == (4, 4)
+    assert (aatype[0] == 31).all()
 
 
 def test_template_rejects_non_json_path(tmp_path) -> None:
