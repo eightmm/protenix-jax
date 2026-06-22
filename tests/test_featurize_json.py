@@ -300,14 +300,6 @@ def test_featurize_json_rejects_unsupported_raw_features() -> None:
                 "covalent_bonds": [{"entity1": "1"}],
             }
         )
-    with pytest.raises(ValueError, match="template"):
-        featurize_protein_json(
-            {
-                "sequences": [
-                    {"proteinChain": {"sequence": "A", "templatesPath": "x.hhr"}}
-                ]
-            }
-        )
     with pytest.raises(ValueError, match="modifications"):
         featurize_protein_json(
             {

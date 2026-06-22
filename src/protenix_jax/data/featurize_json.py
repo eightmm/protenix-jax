@@ -14,6 +14,10 @@ from typing import Any
 import numpy as np
 
 from protenix_jax.data.static_io import save_static_feature_npz
+from protenix_jax.data.template_features import (
+    assemble_template_features,
+    chain_template_dense,
+)
 
 RESTYPE_INDEX = {
     "A": 0,
@@ -252,7 +256,8 @@ def featurize_protein_json(
     )
     profile[:] = assembled_profile
     deletion_mean[:] = assembled_deletion_mean
-    return {
+    template_features = _assemble_chain_templates(chains)
+    out = {
         "atom_to_token_idx": atom_to_token,
         "ref_pos": ref_pos_arr,
         "ref_charge": np.asarray(ref_charge, dtype=np.float32),
@@ -285,6 +290,33 @@ def featurize_protein_json(
         "atom_to_tokatom_idx": np.asarray(atom_to_tokatom_idx, dtype=np.int64),
         "mol_id": np.asarray(mol_id, dtype=np.int64),
     }
+    if template_features is not None:
+        out.update(template_features)
+    return out
+
+
+def _assemble_chain_templates(
+    chains: list[dict[str, Any]],
+) -> dict[str, np.ndarray] | None:
+    """Build per-token template features in chain/token order (torch parity)."""
+
+    chain_dense = []
+    for chain in chains:
+        num_res = _chain_token_count(chain)
+        if chain["kind"] == "protein":
+            sequence = chain["sequence"]
+            chain_dense.append(
+                chain_template_dense(
+                    chain.get("templates_path"),
+                    sequence=sequence,
+                    skip=len(sequence) <= 4,
+                )
+            )
+        else:
+            chain_dense.append(
+                chain_template_dense(None, sequence="X" * num_res, skip=True)
+            )
+    return assemble_template_features(chain_dense)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -392,8 +424,11 @@ def _build_protein_chain(
 ) -> dict[str, Any]:
     if not isinstance(chain, dict):
         raise ValueError("proteinChain entry must be an object")
-    if "templatesPath" in chain:
-        raise ValueError("template paths are not supported")
+    templates_path = chain.get("templatesPath") or None
+    if templates_path:
+        templates_path = str(
+            _resolve_path(templates_path, base_dir=base_dir)
+        )
     if chain.get("modifications"):
         raise ValueError("proteinChain modifications are not supported")
     sequence = _normalize_sequence(chain.get("sequence"))
@@ -412,6 +447,7 @@ def _build_protein_chain(
             "sequence": sequence,
             "paired_a3m": paired_a3m,
             "unpaired_a3m": unpaired_a3m,
+            "templates_path": templates_path,
         },
     }
 
