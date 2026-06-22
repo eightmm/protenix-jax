@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 import numpy as np
-from state_dict_helpers import (
+
+from protenix_jax.bridge.torch_mapping import (
     map_conditioned_transition_state_dict,
     map_diffusion_transformer_block_state_dict,
 )
-
 from protenix_jax.models.diffusion.transformer import (
     conditioned_transition_block,
     diffusion_transformer_block,

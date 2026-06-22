@@ -1,8 +1,15 @@
-"""State-dict conversion helpers for Protenix JAX modules."""
+"""PyTorch checkpoint -> JAX param bridge for Protenix.
+
+Pure-mapping functions are torch-free (tensors are duck-typed via
+``tensor_to_numpy``). ``load_torch_checkpoint`` is the only entry that needs
+PyTorch, and it imports it lazily so the native inference runtime never pulls
+in torch.
+"""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 import jax.numpy as jnp
@@ -1144,3 +1151,37 @@ def map_distogram_state_dict(
     return DistogramParams(
         linear=map_linear_state_dict(state_dict, f"{stem}linear", bias=True)
     )
+
+
+def state_dict_to_params(
+    state_dict: Mapping[str, Any],
+) -> ProtenixInferenceParams:
+    """Public alias: map a Protenix model state-dict to JAX inference params."""
+
+    return map_protenix_inference_state_dict(state_dict)
+
+
+def load_torch_checkpoint(path: str | Path) -> ProtenixInferenceParams:
+    """Load a PyTorch Protenix checkpoint and convert to JAX params.
+
+    Mirrors the upstream Protenix inference loader: reads ``checkpoint["model"]``
+    (falling back to the raw object), strips a DistributedDataParallel
+    ``module.`` prefix, then maps to ``ProtenixInferenceParams``. ``torch`` is
+    imported lazily so the native runtime stays torch-free.
+    """
+
+    import torch
+
+    obj = torch.load(str(path), map_location="cpu", weights_only=False)
+    if isinstance(obj, Mapping) and "model" in obj:
+        state_dict = obj["model"]
+    elif isinstance(obj, Mapping) and "state_dict" in obj:
+        state_dict = obj["state_dict"]
+    else:
+        state_dict = obj
+    if any(str(k).startswith("module.") for k in state_dict):
+        state_dict = {
+            str(k)[len("module.") :] if str(k).startswith("module.") else str(k): v
+            for k, v in state_dict.items()
+        }
+    return map_protenix_inference_state_dict(state_dict)

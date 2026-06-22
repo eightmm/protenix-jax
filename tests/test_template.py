@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 import numpy as np
-from state_dict_helpers import map_template_embedder_state_dict
 
+from protenix_jax.bridge.torch_mapping import map_template_embedder_state_dict
 from protenix_jax.models.primitives.primitives import layer_norm, linear
 from protenix_jax.models.trunk_blocks.template import (
     template_embedder,

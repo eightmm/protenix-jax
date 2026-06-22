@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 import numpy as np
-from state_dict_helpers import map_distogram_state_dict
 
+from protenix_jax.bridge.torch_mapping import map_distogram_state_dict
 from protenix_jax.models.heads.head import distogram_head
 
 

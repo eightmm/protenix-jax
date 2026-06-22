@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from state_dict_helpers import (
+
+from protenix_jax.bridge.torch_mapping import (
     map_adaptive_layer_norm_state_dict,
     map_constraint_embedder_state_dict,
     map_distogram_state_dict,

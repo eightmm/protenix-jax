@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 import numpy as np
-from state_dict_helpers import (
+
+from protenix_jax.bridge.torch_mapping import (
     map_atom_attention_decoder_state_dict,
     map_atom_attention_encoder_cache_state_dict,
     map_atom_attention_encoder_state_dict,
 )
-
 from protenix_jax.models.diffusion.atom import (
     AtomAttentionDecoderParams,
     AtomAttentionEncoderCacheParams,

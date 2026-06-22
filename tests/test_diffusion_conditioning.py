@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 import numpy as np
-from state_dict_helpers import map_diffusion_conditioning_state_dict
 
+from protenix_jax.bridge.torch_mapping import map_diffusion_conditioning_state_dict
 from protenix_jax.models.diffusion.atom import (
     AtomAttentionDecoderParams,
     AtomAttentionEncoderCacheParams,

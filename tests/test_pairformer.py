@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 import numpy as np
-from state_dict_helpers import (
+
+from protenix_jax.bridge.torch_mapping import (
     map_pairformer_block_state_dict,
     map_pairformer_stack_state_dict,
 )
-
 from protenix_jax.models.primitives.attention import attention_pair_bias
 from protenix_jax.models.primitives.primitives import transition
 from protenix_jax.models.triangle.triangle import (

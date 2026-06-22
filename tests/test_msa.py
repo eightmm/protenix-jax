@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 import numpy as np
-from state_dict_helpers import (
+
+from protenix_jax.bridge.torch_mapping import (
     map_msa_block_state_dict,
     map_msa_module_state_dict,
     map_msa_pair_weighted_averaging_state_dict,
     map_outer_product_mean_state_dict,
 )
-
 from protenix_jax.models.primitives.primitives import transition
 from protenix_jax.models.trunk_blocks.msa import (
     msa_block,
