@@ -40,10 +40,10 @@ def test_featurize_sequence_only_protein_json() -> None:
     np.testing.assert_array_equal(features["entity_id"], [0, 0, 0, 0, 0, 0])
     np.testing.assert_array_equal(features["sym_id"], [0, 0, 0, 1, 1, 1])
     assert features["token_bonds"].shape == (6, 6)
-    assert features["atom_to_token_idx"].shape == (28,)
-    assert features["ref_pos"].shape == (28, 3)
-    assert features["ref_element"].shape == (28, 128)
-    assert features["ref_atom_name_chars"].shape == (28, 4, 64)
+    assert features["atom_to_token_idx"].shape == (32,)
+    assert features["ref_pos"].shape == (32, 3)
+    assert features["ref_element"].shape == (32, 128)
+    assert features["ref_atom_name_chars"].shape == (32, 4, 64)
     assert features["d_lm"].shape[-1] == 3
     assert features["v_lm"].shape[-1] == 1
     assert features["pad_info"]["mask_trunked"].shape == features["v_lm"].shape[:-1]

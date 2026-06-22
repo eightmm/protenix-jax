@@ -45,8 +45,39 @@ MSA_PROTEIN_INDEX = {
     "Z": RESTYPE_INDEX["E"],
     "-": 31,
 }
-ELEMENT_INDEX = {"H": 0, "C": 5, "N": 6, "O": 7, "S": 15}
-ATOM_TO_TOKATOM_INDEX = {"N": 0, "CA": 1, "C": 2, "O": 3, "CB": 4}
+ELEMENT_INDEX = {"H": 0, "C": 5, "N": 6, "O": 7, "S": 15, "SE": 33}
+AA1_TO_AA3 = {
+    "A": "ALA", "R": "ARG", "N": "ASN", "D": "ASP", "C": "CYS",
+    "Q": "GLN", "E": "GLU", "G": "GLY", "H": "HIS", "I": "ILE",
+    "L": "LEU", "K": "LYS", "M": "MET", "F": "PHE", "P": "PRO",
+    "S": "SER", "T": "THR", "W": "TRP", "Y": "TYR", "V": "VAL",
+    "X": "UNK",
+}
+_CCD_TABLE_PATH = Path(__file__).with_name("ccd_std_residues.npz")
+_CCD_TABLE: dict[str, dict[str, np.ndarray]] | None = None
+
+
+def _ccd_std_residues() -> dict[str, dict[str, np.ndarray]]:
+    """Lazy-load the vendored CCD reference-conformer table (20 std residues).
+
+    Each residue maps to ``names``/``coord``/``charge``/``elem`` arrays in the
+    canonical RES_ATOMS order (N, CA, C, O, sidechain..., OXT last). OXT is
+    kept only for the C-terminal residue of a chain.
+    """
+
+    global _CCD_TABLE
+    if _CCD_TABLE is None:
+        raw = np.load(_CCD_TABLE_PATH, allow_pickle=False)
+        table: dict[str, dict[str, np.ndarray]] = {}
+        for aa3 in AA1_TO_AA3.values():
+            table[aa3] = {
+                "names": raw[f"{aa3}/names"],
+                "coord": raw[f"{aa3}/coord"].astype(np.float32),
+                "charge": raw[f"{aa3}/charge"].astype(np.float32),
+                "elem": raw[f"{aa3}/elem"],
+            }
+        _CCD_TABLE = table
+    return _CCD_TABLE
 
 
 def load_first_job(path: str | Path) -> dict[str, Any]:
@@ -98,6 +129,7 @@ def featurize_protein_json(
     atom_to_token_idx: list[int] = []
     atom_to_tokatom_idx: list[int] = []
     ref_pos: list[tuple[float, float, float]] = []
+    ref_charge: list[float] = []
     ref_element: list[str] = []
     ref_atom_names: list[str] = []
     distogram_rep_atom_mask: list[int] = []
@@ -115,16 +147,22 @@ def featurize_protein_json(
             asym_id[token_i] = chain["asym_id"]
             entity_id[token_i] = chain["entity_id"]
             sym_id[token_i] = chain["sym_id"]
-            atom_names = _residue_atom_names(aa)
-            for atom_name in atom_names:
+            entry = _ccd_std_residues()[AA1_TO_AA3[aa]]
+            names = entry["names"]
+            is_cterm = pos == len(sequence)
+            rep = _distogram_rep_atom_name(aa)
+            for j, atom_name in enumerate(names):
+                atom_name = str(atom_name)
+                if atom_name == "OXT" and not is_cterm:
+                    continue
                 atom_to_token_idx.append(token_i)
-                atom_to_tokatom_idx.append(ATOM_TO_TOKATOM_INDEX[atom_name])
-                ref_pos.append(_dummy_atom_position(pos, atom_name, chain["asym_id"]))
-                ref_element.append(_element_from_atom_name(atom_name))
+                atom_to_tokatom_idx.append(j)
+                xyz = entry["coord"][j]
+                ref_pos.append((float(xyz[0]), float(xyz[1]), float(xyz[2])))
+                ref_charge.append(float(entry["charge"][j]))
+                ref_element.append(str(entry["elem"][j]))
                 ref_atom_names.append(atom_name)
-                distogram_rep_atom_mask.append(
-                    int(atom_name == _distogram_rep_atom_name(aa))
-                )
+                distogram_rep_atom_mask.append(int(atom_name == rep))
                 mol_id.append(chain["asym_id"])
             token_i += 1
 
@@ -149,7 +187,7 @@ def featurize_protein_json(
     return {
         "atom_to_token_idx": atom_to_token,
         "ref_pos": ref_pos_arr,
-        "ref_charge": np.zeros((len(atom_to_token),), dtype=np.float32),
+        "ref_charge": np.asarray(ref_charge, dtype=np.float32),
         "ref_mask": np.ones((len(atom_to_token),), dtype=np.float32),
         "ref_atom_name_chars": _encode_atom_name_chars(ref_atom_names),
         "ref_element": _encode_elements(ref_element),
@@ -451,40 +489,10 @@ def _normalize_sequence(sequence: Any) -> str:
     return sequence
 
 
-def _residue_atom_names(aa: str) -> tuple[str, ...]:
-    if aa == "G":
-        return ("N", "CA", "C", "O")
-    return ("N", "CA", "C", "O", "CB")
-
-
 def _distogram_rep_atom_name(aa: str) -> str:
     if aa == "G":
         return "CA"
     return "CB"
-
-
-def _dummy_atom_position(
-    residue_index: int,
-    atom_name: str,
-    asym_id: int,
-) -> tuple[float, float, float]:
-    base_x = float((residue_index - 1) * 3.8)
-    chain_y = float(asym_id * 8.0)
-    offsets = {
-        "N": (0.0, 0.0, 0.0),
-        "CA": (1.45, 0.0, 0.0),
-        "C": (2.9, 0.0, 0.0),
-        "O": (3.5, 0.4, 0.0),
-        "CB": (1.45, 1.5, 0.0),
-    }
-    dx, dy, dz = offsets[atom_name]
-    return base_x + dx, chain_y + dy, dz
-
-
-def _element_from_atom_name(atom_name: str) -> str:
-    if atom_name.startswith("C"):
-        return "C"
-    return atom_name[0]
 
 
 def _encode_elements(elements: list[str]) -> np.ndarray:

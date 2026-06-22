@@ -118,7 +118,7 @@ def test_static_infer_runs_from_sequence_json_features(tmp_path) -> None:
     )
 
     with np.load(out_path) as data:
-        assert data["coordinate"].shape == (1, 9, 3)
+        assert data["coordinate"].shape == (1, 10, 3)
         assert data["distogram_logits"].shape == (2, 2, 3)
         assert data["summary_plddt"].shape == (1,)
 
@@ -165,7 +165,7 @@ def test_static_infer_runs_directly_from_sequence_json(tmp_path) -> None:
     )
 
     with np.load(out_path) as data:
-        assert data["coordinate"].shape == (1, 9, 3)
+        assert data["coordinate"].shape == (1, 10, 3)
         assert data["summary_plddt"].shape == (1,)
 
 

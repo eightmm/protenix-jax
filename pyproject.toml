@@ -27,6 +27,9 @@ protenix-jax-static-infer = "protenix_jax.cli.static_infer:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+protenix_jax = ["data/*.npz"]
+
 [tool.ruff]
 line-length = 88
 target-version = "py311"

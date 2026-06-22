@@ -134,7 +134,7 @@ def test_predict_direct_json_to_output_imports_no_torch_or_protenix(
     )
 
     with np.load(out_path) as data:
-        assert data["coordinate"].shape == (1, 9, 3)
+        assert data["coordinate"].shape == (1, 10, 3)
         assert data["summary_plddt"].shape == (1,)
 
 
