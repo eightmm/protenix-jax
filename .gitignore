@@ -13,3 +13,4 @@ outputs/*
 *.ckpt
 *.safetensors
 .omc/
+scratchpad/
