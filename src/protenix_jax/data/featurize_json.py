@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
+import string
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -179,11 +181,7 @@ def featurize_protein_json(
         raise ValueError("n_keys must be >= n_queries and both must be even")
     if max_msa_rows <= 0:
         raise ValueError("max_msa_rows must be positive")
-    chains = _expand_chains(
-        job,
-        base_dir=base_dir,
-        max_msa_rows=max_msa_rows,
-    )
+    chains = _expand_chains(job, base_dir=base_dir)
     n_token = sum(_chain_token_count(chain) for chain in chains)
     if n_token <= 0:
         raise ValueError("at least one token is required")
@@ -249,10 +247,11 @@ def featurize_protein_json(
         sym_id=sym_id,
         token_index=token_index,
     )
-    msa, deletion_matrix = _merge_chain_msa_features(
-        chains,
-        max_msa_rows=max_msa_rows,
+    msa, deletion_matrix, assembled_profile, assembled_deletion_mean = (
+        _assemble_msa_features(chains, max_msa_rows=max_msa_rows)
     )
+    profile[:] = assembled_profile
+    deletion_mean[:] = assembled_deletion_mean
     return {
         "atom_to_token_idx": atom_to_token,
         "ref_pos": ref_pos_arr,
@@ -325,7 +324,7 @@ def parse_a3m_rows(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Parse protein A3M content into Protenix MSA rows and deletion matrix."""
 
-    records = _parse_a3m_records(a3m)
+    records, _descs = _parse_a3m_records(a3m)
     if not records:
         records = [query_sequence]
     rows = []
@@ -348,7 +347,6 @@ def _expand_chains(
     job: dict[str, Any],
     *,
     base_dir: str | Path | None,
-    max_msa_rows: int,
 ) -> list[dict[str, Any]]:
     if job.get("covalent_bonds"):
         raise ValueError("covalent_bonds are not supported")
@@ -363,9 +361,7 @@ def _expand_chains(
             raise ValueError("each sequence entry must have one entity key")
         (kind,) = entry.keys()
         if kind == "proteinChain":
-            built = _build_protein_chain(
-                entry[kind], base_dir=base_dir, max_msa_rows=max_msa_rows
-            )
+            built = _build_protein_chain(entry[kind], base_dir=base_dir)
         elif kind in ("dnaSequence", "rnaSequence"):
             built = _build_nucleic_chain(entry[kind], kind=kind)
         elif kind in ("ligand", "ion"):
@@ -393,7 +389,6 @@ def _build_protein_chain(
     chain: dict[str, Any],
     *,
     base_dir: str | Path | None,
-    max_msa_rows: int,
 ) -> dict[str, Any]:
     if not isinstance(chain, dict):
         raise ValueError("proteinChain entry must be an object")
@@ -402,12 +397,7 @@ def _build_protein_chain(
     if chain.get("modifications"):
         raise ValueError("proteinChain modifications are not supported")
     sequence = _normalize_sequence(chain.get("sequence"))
-    msa_profile, msa_deletion_mean, msa, deletion_matrix = _load_chain_msa_features(
-        sequence,
-        chain,
-        base_dir=base_dir,
-        max_msa_rows=max_msa_rows,
-    )
+    paired_a3m, unpaired_a3m = _read_chain_a3m(chain, base_dir=base_dir)
     count = int(chain.get("count", 1))
     if count <= 0:
         raise ValueError("proteinChain count must be positive")
@@ -420,10 +410,8 @@ def _build_protein_chain(
         "chain": {
             "kind": "protein",
             "sequence": sequence,
-            "profile": msa_profile,
-            "deletion_mean": msa_deletion_mean,
-            "msa": msa,
-            "deletion_matrix": deletion_matrix,
+            "paired_a3m": paired_a3m,
+            "unpaired_a3m": unpaired_a3m,
         },
     }
 
@@ -528,12 +516,9 @@ def _emit_protein_tokens(
     chain: dict[str, Any], state: dict[str, Any]
 ) -> None:
     sequence = chain["sequence"]
-    chain_profile, chain_deletion_mean = _chain_msa_features(chain)
     for pos, aa in enumerate(sequence, start=1):
         token_i = state["token_i"]
         state["restype"][token_i, RESTYPE_INDEX[aa]] = 1.0
-        state["profile"][token_i] = chain_profile[pos - 1]
-        state["deletion_mean"][token_i] = chain_deletion_mean[pos - 1]
         state["residue_index"][token_i] = pos
         state["asym_id"][token_i] = chain["asym_id"]
         state["entity_id"][token_i] = chain["entity_id"]
@@ -622,107 +607,321 @@ def _emit_nucleic_tokens(
         state["token_i"] = token_i + 1
 
 
-def _load_chain_msa_features(
-    sequence: str,
+_GAP_IDX = MSA_PROTEIN_INDEX["-"]
+_MSA_PAD_VALUES = {"msa": _GAP_IDX, "deletion_matrix": 0}
+_UNIPROT_REGEX = re.compile(
+    r"(?:tr|sp)\|[A-Z0-9]{6,10}(?:_\d+)?\|"
+    r"(?:[A-Z0-9]{1,10}_)(?P<SpeciesId>[A-Z0-9]{1,5})"
+)
+_UNIREF_REGEX = re.compile(r"^UniRef100_[^_]+_([^_/]+)")
+
+
+def _read_chain_a3m(
     chain: dict[str, Any],
     *,
     base_dir: str | Path | None,
-    max_msa_rows: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    paths = [
-        chain[key]
-        for key in ("pairedMsaPath", "unpairedMsaPath")
-        if key in chain and chain[key]
-    ]
-    profiles = []
-    deletion_means = []
-    msa_rows = []
-    deletion_rows = []
-    for path in paths:
-        a3m_path = _resolve_path(path, base_dir=base_dir)
-        a3m = a3m_path.read_text(encoding="utf-8")
-        msa, deletion_matrix = parse_a3m_rows(sequence, a3m)
-        profile = (msa[..., None] == np.arange(32)).sum(axis=0) / msa.shape[0]
-        deletion_mean = deletion_matrix.mean(axis=0)
-        profiles.append(profile)
-        deletion_means.append(deletion_mean)
-        msa_rows.append(msa)
-        deletion_rows.append(deletion_matrix)
-    if not profiles:
-        restype = np.zeros((len(sequence), 32), dtype=np.float32)
-        for i, aa in enumerate(sequence):
-            restype[i, RESTYPE_INDEX[aa]] = 1.0
-        msa, deletion_matrix = parse_a3m_rows(sequence, "")
-        return (
-            restype,
-            np.zeros((len(sequence),), dtype=np.float32),
-            msa,
-            deletion_matrix,
-        )
-    merged_msa, merged_deletion_matrix = _deduplicate_msa_rows(
-        np.concatenate(msa_rows, axis=0),
-        np.concatenate(deletion_rows, axis=0),
-    )
-    merged_msa = merged_msa[:max_msa_rows]
-    merged_deletion_matrix = merged_deletion_matrix[:max_msa_rows]
-    return (
-        np.mean(np.stack(profiles), axis=0).astype(np.float32),
-        np.mean(np.stack(deletion_means), axis=0).astype(np.float32),
-        merged_msa,
-        merged_deletion_matrix,
-    )
+) -> tuple[str, str]:
+    """Read paired/unpaired A3M for a protein chain (inline or precomputed)."""
+
+    def _resolve(inline_key: str, path_key: str) -> str:
+        inline = chain.get(inline_key)
+        if inline:
+            return inline
+        path = chain.get(path_key)
+        if path:
+            return _resolve_path(path, base_dir=base_dir).read_text(encoding="utf-8")
+        return ""
+
+    paired = _resolve("pairedMsa", "pairedMsaPath")
+    unpaired = _resolve("unpairedMsa", "unpairedMsaPath")
+    return paired, unpaired
 
 
-def _chain_msa_features(chain: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
-    return chain["profile"], chain["deletion_mean"]
+def _species_id(description: str) -> str:
+    """Extract a species identifier from a UniProt/UniRef description line."""
+
+    desc = description.strip()
+    m = _UNIPROT_REGEX.match(desc) or _UNIREF_REGEX.match(desc)
+    if not m:
+        return ""
+    return m.group("SpeciesId") if "SpeciesId" in m.groupdict() else m.group(1)
 
 
-def _deduplicate_msa_rows(
-    msa: np.ndarray,
-    deletion_matrix: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    keep = []
-    seen = set()
-    for i, row in enumerate(msa.astype(np.int8)):
-        key = row.tobytes()
-        if key in seen:
+def _featurize_a3m(
+    query: str,
+    a3m: str,
+    *,
+    dedup: bool,
+) -> dict[str, np.ndarray]:
+    """Port of torch ``RawMsa(...).featurize`` for protein chains."""
+
+    seqs, descs = _parse_a3m_records(a3m)
+    if dedup:
+        seqs, descs = _dedup_sequences(seqs, descs)
+    if not seqs:
+        seqs, descs = [query], ["Original query"]
+    cols = len(query)
+    msa = np.zeros((len(seqs), cols), dtype=np.int64)
+    deletion = np.zeros((len(seqs), cols), dtype=np.int64)
+    for i, sequence in enumerate(seqs):
+        row, dels = _aligned_protein_row(sequence)
+        n = min(len(row), cols)
+        msa[i, :n] = row[:n]
+        deletion[i, :n] = dels[:n]
+    return {
+        "msa": msa,
+        "deletion_matrix": deletion,
+        "species": np.array([_species_id(d) for d in descs], dtype=object),
+    }
+
+
+def _dedup_sequences(
+    seqs: list[str], descs: list[str]
+) -> tuple[list[str], list[str]]:
+    """Remove duplicate sequences ignoring insertion (lowercase) columns."""
+
+    table = str.maketrans("", "", string.ascii_lowercase)
+    u_seqs: list[str] = []
+    u_descs: list[str] = []
+    seen: set[str] = set()
+    for s, d in zip(seqs, descs):
+        stripped = s.translate(table)
+        if stripped not in seen:
+            seen.add(stripped)
+            u_seqs.append(s)
+            u_descs.append(d)
+    return u_seqs, u_descs
+
+
+def _gap_only_chain_features(width: int) -> dict[str, np.ndarray]:
+    """Single gap row used for ligand/nucleic chains (torch placeholder)."""
+
+    return {
+        "msa": np.full((1, width), _GAP_IDX, dtype=np.int64),
+        "deletion_matrix": np.zeros((1, width), dtype=np.int64),
+        "species": np.array([""], dtype=object),
+    }
+
+
+def _align_species(
+    all_species: list[str],
+    chain_species_map: list[dict[str, np.ndarray]],
+    species_min_hits: dict[str, int],
+) -> np.ndarray:
+    blocks = []
+    for species in all_species:
+        rows = []
+        for s2r in chain_species_map:
+            n = species_min_hits[species]
+            if species not in s2r:
+                rows.append(np.full(n, -1, dtype=np.int32))
+            else:
+                rows.append(s2r[species][:n])
+        blocks.append(np.stack(rows, axis=1))
+    return np.concatenate(blocks, axis=0)
+
+
+def _pair_chains_by_species(
+    chains: list[dict[str, np.ndarray]],
+    max_paired: int,
+    active: set[int],
+    max_per_species: int,
+) -> list[dict[str, np.ndarray]]:
+    """Port of torch ``MSAPairingEngine.pair_chains_by_species``."""
+
+    chain_species_map: list[dict[str, np.ndarray]] = []
+    all_counts: dict[str, int] = {}
+    min_hits: dict[str, int] = {}
+    for c in chains:
+        ids = c.get("species_all_seq", np.array([], dtype=object))
+        no_species = ids.size == 0 or (ids.size == 1 and not ids[0])
+        if no_species or c["asym_id"] not in active:
+            chain_species_map.append({})
             continue
-        seen.add(key)
-        keep.append(i)
-    return msa[keep], deletion_matrix[keep]
+        row_idx = np.arange(len(ids))
+        order = ids.argsort(kind="stable")
+        ids_s = ids[order]
+        row_idx = row_idx[order]
+        species, uniq = np.unique(ids_s, return_index=True)
+        grouped = np.split(row_idx, uniq[1:])
+        mapping = dict(zip(species, grouped))
+        chain_species_map.append(mapping)
+        for s in species:
+            all_counts[s] = all_counts.get(s, 0) + 1
+        for s, idxs in mapping.items():
+            min_hits[s] = min(min_hits.get(s, max_per_species), len(idxs))
+
+    ranked: dict[int, list[str]] = {}
+    for s, count in all_counts.items():
+        if not s or count <= 1:
+            continue
+        ranked.setdefault(count, []).append(s)
+
+    pair_idxs = [np.zeros((1, len(chains)), dtype=np.int32)]
+    total = 0
+    for count in sorted(ranked.keys(), reverse=True):
+        rows = _align_species(ranked[count], chain_species_map, min_hits)
+        rank = np.sum(np.log(np.abs(rows.astype(np.float32)) + 1e-10), axis=1)
+        pair_idxs.append(rows[np.argsort(rank)])
+        total += rows.shape[0]
+        if total >= max_paired:
+            break
+    final_idxs = np.concatenate(pair_idxs, axis=0)[:max_paired]
+
+    new_chains = []
+    for i, c in enumerate(chains):
+        nc = {k: v for k, v in c.items() if "all_seq" not in k}
+        sel = final_idxs[:, i]
+        for f in ["msa", "deletion_matrix"]:
+            src = c[f"{f}_all_seq"]
+            pad = np.full((1, src.shape[1]), _MSA_PAD_VALUES[f], src.dtype)
+            padded = np.concatenate([src, pad], axis=0)
+            nc[f"{f}_all_seq"] = padded[sel]
+        new_chains.append(nc)
+    return new_chains
 
 
-def _merge_chain_msa_features(
+def _cleanup_unpaired(
+    chains: list[dict[str, np.ndarray]],
+) -> list[dict[str, np.ndarray]]:
+    """Drop unpaired rows already present in the paired MSA (torch port)."""
+
+    for c in chains:
+        paired_bytes = {row.tobytes() for row in c["msa_all_seq"].astype(np.int8)}
+        keep = [
+            i
+            for i, row in enumerate(c["msa"].astype(np.int8))
+            if row.tobytes() not in paired_bytes
+        ]
+        c["msa"] = c["msa"][keep]
+        c["deletion_matrix"] = c["deletion_matrix"][keep]
+    return chains
+
+
+def _filter_all_gapped_rows(
+    chains: list[dict[str, np.ndarray]],
+    active: set[int],
+) -> list[dict[str, np.ndarray]]:
+    """Remove all-gap rows from the paired MSA across active chains."""
+
+    subset = [c["msa_all_seq"] for c in chains if c["asym_id"] in active]
+    if not subset:
+        return chains
+    non_gap = np.any(np.concatenate(subset, axis=1) != _GAP_IDX, axis=1)
+    for c in chains:
+        c["msa_all_seq"] = c["msa_all_seq"][non_gap]
+        c["deletion_matrix_all_seq"] = c["deletion_matrix_all_seq"][non_gap]
+    return chains
+
+
+def _merge_feature(chains: list[dict[str, np.ndarray]], key: str) -> np.ndarray:
+    if "_all_seq" in key:
+        return np.concatenate([c[key] for c in chains], axis=1)
+    max_d = max(c[key].shape[0] for c in chains)
+    base = key
+    pads = [
+        np.pad(
+            c[key],
+            ((0, max_d - c[key].shape[0]), (0, 0)),
+            constant_values=_MSA_PAD_VALUES.get(base, 0),
+        )
+        for c in chains
+    ]
+    return np.concatenate(pads, axis=1)
+
+
+def _assemble_msa_features(
     chains: list[dict[str, Any]],
     *,
     max_msa_rows: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    max_depth = min(max(chain["msa"].shape[0] for chain in chains), max_msa_rows)
-    msa_parts = []
-    deletion_parts = []
-    for chain in chains:
-        msa = chain["msa"][:max_depth]
-        deletion_matrix = chain["deletion_matrix"][:max_depth]
-        pad_depth = max_depth - msa.shape[0]
-        if pad_depth:
-            width = _chain_token_count(chain)
-            msa = np.pad(
-                msa,
-                ((0, pad_depth), (0, 0)),
-                constant_values=MSA_PROTEIN_INDEX["-"],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Port of torch ``FeatureAssemblyLine.assemble`` for inference inputs."""
+
+    unique_prot_seqs = {
+        c["sequence"] for c in chains if c["kind"] == "protein"
+    }
+    need_pairing = len(unique_prot_seqs) > 1
+    active = {c["asym_id"] for c in chains}
+
+    raw_chains: list[dict[str, np.ndarray]] = []
+    for c in chains:
+        width = _chain_token_count(c)
+        if c["kind"] == "protein":
+            skip = len(c["sequence"]) <= 4
+            up = _featurize_a3m(
+                c["sequence"],
+                "" if skip else c["unpaired_a3m"],
+                dedup=True,
             )
-            deletion_matrix = np.pad(
-                deletion_matrix,
-                ((0, pad_depth), (0, 0)),
-                constant_values=0,
+            p = _featurize_a3m(
+                c["sequence"],
+                c["paired_a3m"] if (need_pairing and not skip) else "",
+                dedup=False,
             )
-            if msa.shape[1] != width or deletion_matrix.shape[1] != width:
-                raise ValueError("MSA row width must match chain sequence length")
-        msa_parts.append(msa)
-        deletion_parts.append(deletion_matrix)
+        else:
+            up = _gap_only_chain_features(width)
+            p = _gap_only_chain_features(width)
+        feat: dict[str, np.ndarray] = dict(up)
+        feat.update({f"{k}_all_seq": v for k, v in p.items()})
+        feat["asym_id"] = c["asym_id"]
+        msa = feat["msa"]
+        prof = (msa[..., None] == np.arange(32)).sum(axis=0) / msa.shape[0]
+        feat["profile"] = prof.astype(np.float32)
+        feat["deletion_mean"] = np.mean(feat["deletion_matrix"], axis=0)
+        raw_chains.append(feat)
+
+    max_p = max_msa_rows // 2
+    if need_pairing:
+        raw_chains = _pair_chains_by_species(raw_chains, max_p, active, 600)
+        raw_chains = _cleanup_unpaired(raw_chains)
+    if "msa_all_seq" in raw_chains[0]:
+        raw_chains = _filter_all_gapped_rows(raw_chains, active)
+
+    cropped = []
+    for c in raw_chains:
+        p_msa = c.get("msa_all_seq")
+        ps = min(p_msa.shape[0], max_p) if p_msa is not None else 0
+        us = max(0, min(c["msa"].shape[0], max_msa_rows - ps))
+        cr: dict[str, np.ndarray] = {
+            "asym_id": c["asym_id"],
+            "profile": c["profile"],
+            "deletion_mean": c["deletion_mean"],
+        }
+        for k in ("msa", "deletion_matrix"):
+            cr[k] = c[k][:us]
+            if f"{k}_all_seq" in c:
+                cr[f"{k}_all_seq"] = c[f"{k}_all_seq"][:ps]
+        cropped.append(cr)
+
+    merged: dict[str, np.ndarray] = {}
+    for base in ("msa", "deletion_matrix"):
+        for f in (base, f"{base}_all_seq"):
+            if f in cropped[0]:
+                merged[f] = _merge_feature(cropped, f)
+    profile = np.concatenate([c["profile"] for c in cropped], axis=0)
+    deletion_mean = np.concatenate([c["deletion_mean"] for c in cropped], axis=0)
+
+    max_u = max(c["msa"].shape[0] for c in cropped if c["asym_id"] in active)
+    merged["msa"] = merged["msa"][:max_u]
+    merged["deletion_matrix"] = merged["deletion_matrix"][:max_u]
+    if "msa_all_seq" in merged:
+        max_pa = max(
+            c["msa_all_seq"].shape[0] for c in cropped if c["asym_id"] in active
+        )
+        merged["msa_all_seq"] = merged["msa_all_seq"][:max_pa]
+        merged["deletion_matrix_all_seq"] = merged["deletion_matrix_all_seq"][:max_pa]
+        for base in ("msa", "deletion_matrix"):
+            merged[base] = np.concatenate(
+                [merged[f"{base}_all_seq"], merged[base]], axis=0
+            )
+
+    msa = merged["msa"].astype(np.int64)
+    deletion_matrix = merged["deletion_matrix"].astype(np.float32)
     return (
-        np.concatenate(msa_parts, axis=1).astype(np.int64),
-        np.concatenate(deletion_parts, axis=1).astype(np.float32),
+        msa,
+        deletion_matrix,
+        profile.astype(np.float32),
+        deletion_mean.astype(np.float32),
     )
 
 
@@ -735,22 +934,23 @@ def _resolve_path(path: str | Path, *, base_dir: str | Path | None) -> Path:
     return resolved
 
 
-def _parse_a3m_records(a3m: str) -> list[str]:
-    records: list[str] = []
-    current: list[str] = []
+def _parse_a3m_records(a3m: str) -> tuple[list[str], list[str]]:
+    """Parse FASTA/A3M into (sequences, descriptions); torch ``parse_fasta``."""
+
+    sequences: list[str] = []
+    descriptions: list[str] = []
+    index = -1
     for raw_line in a3m.splitlines():
         line = raw_line.strip()
-        if not line:
+        if not line or line.startswith("#"):
             continue
         if line.startswith(">"):
-            if current:
-                records.append("".join(current))
-                current = []
-            continue
-        current.append(line)
-    if current:
-        records.append("".join(current))
-    return records
+            index += 1
+            descriptions.append(line[1:])
+            sequences.append("")
+        elif index >= 0:
+            sequences[index] += line
+    return sequences, descriptions
 
 
 def _aligned_protein_row(sequence: str) -> tuple[list[int], list[int]]:

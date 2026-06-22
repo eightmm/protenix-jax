@@ -83,13 +83,14 @@ def test_parse_a3m_profile_rejects_misaligned_rows() -> None:
 
 
 def test_featurize_json_uses_msa_profile(tmp_path) -> None:
+    # Sequence length must exceed 4 or torch skips the unpaired MSA.
     msa_path = tmp_path / "toy.a3m"
-    msa_path.write_text(">query\nAG\n>hit\nA-\n")
+    msa_path.write_text(">query\nAGCDE\n>hit\nAGCD-\n")
     job = {
         "sequences": [
             {
                 "proteinChain": {
-                    "sequence": "AG",
+                    "sequence": "AGCDE",
                     "unpairedMsaPath": "toy.a3m",
                 }
             }
@@ -99,45 +100,134 @@ def test_featurize_json_uses_msa_profile(tmp_path) -> None:
     features = featurize_protein_json(job, base_dir=tmp_path, n_queries=2, n_keys=4)
 
     np.testing.assert_allclose(features["profile"][0, 0], 1.0)
-    np.testing.assert_allclose(features["profile"][1, 7], 0.5)
-    np.testing.assert_allclose(features["profile"][1, 31], 0.5)
-    np.testing.assert_allclose(features["deletion_mean"], [0.0, 0.0])
+    # Last column: 50% Glu(E=6 in query) ... actually E=6, gap=31 from hit.
+    np.testing.assert_allclose(features["profile"][4, 6], 0.5)
+    np.testing.assert_allclose(features["profile"][4, 31], 0.5)
+    np.testing.assert_allclose(features["deletion_mean"], np.zeros(5))
 
 
 def test_featurize_json_emits_global_msa_rows(tmp_path) -> None:
+    # Two distinct protein chains -> torch multimer pairing path.
+    # Chain A unpaired MSA: query + one hit with an insertion column.
     msa_path = tmp_path / "a.a3m"
-    msa_path.write_text(">query\nAG\n>hit\nAc-\n")
+    msa_path.write_text(">query\nAGCDE\n>hit\nAGCDc-\n")
     job = {
         "sequences": [
             {
                 "proteinChain": {
-                    "sequence": "AG",
+                    "sequence": "AGCDE",
                     "unpairedMsaPath": "a.a3m",
                 }
             },
-            {"proteinChain": {"sequence": "CD"}},
+            {"proteinChain": {"sequence": "KLMNP"}},
         ]
     }
 
     features = featurize_protein_json(job, base_dir=tmp_path, n_queries=2, n_keys=4)
 
+    # Row 0: paired query block (chain A | chain B). Row 1: chain A unpaired hit
+    # padded with gaps over chain B columns (paired block first, then unpaired).
     np.testing.assert_array_equal(
         features["msa"],
         [
-            [0, 7, 4, 3],
-            [0, 31, 31, 31],
+            [0, 7, 4, 3, 6, 11, 10, 12, 2, 14],
+            [0, 7, 4, 3, 31, 31, 31, 31, 31, 31],
         ],
     )
-    np.testing.assert_array_equal(
-        features["has_deletion"],
-        [
-            [0.0, 0.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0, 0.0],
-        ],
-    )
-    expected_deletion = np.zeros((2, 4), dtype=np.float32)
-    expected_deletion[1, 1] = np.arctan(1 / 3) * (2 / np.pi)
+    expected_has_del = np.zeros((2, 10), dtype=np.float32)
+    expected_has_del[1, 4] = 1.0
+    np.testing.assert_array_equal(features["has_deletion"], expected_has_del)
+    expected_deletion = np.zeros((2, 10), dtype=np.float32)
+    expected_deletion[1, 4] = np.arctan(1 / 3) * (2 / np.pi)
     np.testing.assert_allclose(features["deletion_value"], expected_deletion)
+
+
+def test_featurize_json_multimer_pairing_matches_torch() -> None:
+    # Golden arrays produced by torch Protenix FeatureAssemblyLine.assemble
+    # on the same paired+unpaired 2-chain input (see msa_featurizer.py).
+    seq_a = "AGCDEFHIKL"
+    seq_b = "KLMNPQRSTV"
+    paired_a = (
+        ">q\nAGCDEFHIKL\n>UniRef100_a_HUMAN\nAGCDAFHIKL\n"
+        ">UniRef100_b_MOUSE\nAGCDEFHIKA\n"
+    )
+    paired_b = (
+        ">q\nKLMNPQRSTV\n>UniRef100_c_HUMAN\nKLMNAQRSTV\n"
+        ">UniRef100_d_MOUSE\nKLMNPQRSTA\n"
+    )
+    unpaired_a = ">q\nAGCDEFHIKL\n>h1\nAGCDeFHIKL\n>h2\nAGCDEFHIKK\n"
+    unpaired_b = ">q\nKLMNPQRSTV\n>h1\nKLMN-QRSTV\n"
+    job = {
+        "sequences": [
+            {
+                "proteinChain": {
+                    "sequence": seq_a,
+                    "pairedMsa": paired_a,
+                    "unpairedMsa": unpaired_a,
+                }
+            },
+            {
+                "proteinChain": {
+                    "sequence": seq_b,
+                    "pairedMsa": paired_b,
+                    "unpairedMsa": unpaired_b,
+                }
+            },
+        ]
+    }
+
+    features = featurize_protein_json(job)
+
+    expected_msa = [
+        [0, 7, 4, 3, 6, 13, 8, 9, 11, 10, 11, 10, 12, 2, 14, 5, 1, 15, 16, 19],
+        [0, 7, 4, 3, 0, 13, 8, 9, 11, 10, 11, 10, 12, 2, 0, 5, 1, 15, 16, 19],
+        [0, 7, 4, 3, 6, 13, 8, 9, 11, 0, 11, 10, 12, 2, 14, 5, 1, 15, 16, 0],
+        [0, 7, 4, 3, 13, 8, 9, 11, 10, 0, 11, 10, 12, 2, 31, 5, 1, 15, 16, 19],
+        [0, 7, 4, 3, 6, 13, 8, 9, 11, 11, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31],
+    ]
+    np.testing.assert_array_equal(features["msa"], expected_msa)
+
+    expected_has_del = np.zeros((5, 20), dtype=np.float32)
+    expected_has_del[3, 4] = 1.0
+    np.testing.assert_array_equal(features["has_deletion"], expected_has_del)
+
+    expected_dv = np.zeros((5, 20), dtype=np.float32)
+    expected_dv[3, 4] = np.arctan(1 / 3) * (2 / np.pi)
+    np.testing.assert_allclose(features["deletion_value"], expected_dv, atol=1e-6)
+
+    expected_dm = np.zeros(20, dtype=np.float32)
+    expected_dm[4] = 1 / 3
+    np.testing.assert_allclose(features["deletion_mean"], expected_dm, atol=1e-6)
+
+
+def test_featurize_json_paired_msa_path_loading(tmp_path) -> None:
+    # pairedMsaPath/unpairedMsaPath must match inline pairedMsa/unpairedMsa.
+    seq_a, seq_b = "AGCDEFHIKL", "KLMNPQRSTV"
+    (tmp_path / "pa.a3m").write_text(
+        ">q\nAGCDEFHIKL\n>UniRef100_a_HUMAN\nAGCDAFHIKL\n"
+    )
+    (tmp_path / "pb.a3m").write_text(
+        ">q\nKLMNPQRSTV\n>UniRef100_c_HUMAN\nKLMNAQRSTV\n"
+    )
+    (tmp_path / "ua.a3m").write_text(">q\nAGCDEFHIKL\n>h2\nAGCDEFHIKK\n")
+    job = {
+        "sequences": [
+            {
+                "proteinChain": {
+                    "sequence": seq_a,
+                    "pairedMsaPath": "pa.a3m",
+                    "unpairedMsaPath": "ua.a3m",
+                }
+            },
+            {"proteinChain": {"sequence": seq_b, "pairedMsaPath": "pb.a3m"}},
+        ]
+    }
+    features = featurize_protein_json(job, base_dir=tmp_path)
+    # Paired query row first, then HUMAN-paired row, then chain-A unpaired hit.
+    assert features["msa"].shape == (3, 20)
+    np.testing.assert_array_equal(features["msa"][0, :4], [0, 7, 4, 3])
+    # chain B columns of the unpaired row are gap-padded.
+    np.testing.assert_array_equal(features["msa"][2, 10:], [31] * 10)
 
 
 def test_featurize_json_rejects_unsupported_entities() -> None:
