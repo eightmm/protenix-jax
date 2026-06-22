@@ -1,0 +1,15 @@
+.venv/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+outputs/*
+!outputs/.gitkeep
+
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+.omc/
