@@ -143,11 +143,53 @@ def test_featurize_json_emits_global_msa_rows(tmp_path) -> None:
 def test_featurize_json_rejects_unsupported_entities() -> None:
     job = {
         "name": "bad",
-        "sequences": [{"dnaSequence": {"sequence": "ACGT", "count": 1}}],
+        "sequences": [{"peptideNucleicAcid": {"sequence": "ACGT", "count": 1}}],
     }
 
     with pytest.raises(ValueError, match="unsupported entity kind"):
         featurize_protein_json(job)
+
+
+def test_featurize_dna_sequence() -> None:
+    # GATC: per-residue tokens; OP3 only on the 5'-terminal residue.
+    job = {
+        "name": "dna",
+        "sequences": [{"dnaSequence": {"sequence": "GATC", "count": 1}}],
+    }
+
+    features = featurize_protein_json(job)
+
+    assert features["restype"].shape[0] == 4
+    # torch STD_RESIDUES: DG=27, DA=26, DT=29, DC=28.
+    assert features["restype"].argmax(-1).tolist() == [27, 26, 29, 28]
+    # 23(DG)+22(DA)+21(DT)+21(DC) heavy atoms; OP3 dropped on residues 2-4.
+    assert features["atom_to_token_idx"].shape[0] == 83
+    assert features["ref_pos"].shape[0] == 83
+    # one distogram representative atom per token (purine C4, pyrimidine C2).
+    assert int(features["distogram_rep_atom_mask"].sum()) == 4
+    assert features["residue_index"].tolist() == [1, 2, 3, 4]
+
+
+def test_featurize_rna_sequence() -> None:
+    job = {
+        "name": "rna",
+        "sequences": [{"rnaSequence": {"sequence": "GAUC", "count": 1}}],
+    }
+
+    features = featurize_protein_json(job)
+
+    assert features["restype"].shape[0] == 4
+    # torch STD_RESIDUES: G=22, A=21, U=24, C=23.
+    assert features["restype"].argmax(-1).tolist() == [22, 21, 24, 23]
+    assert features["atom_to_token_idx"].shape[0] == 86
+    assert int(features["distogram_rep_atom_mask"].sum()) == 4
+
+
+def test_featurize_rejects_unsupported_nucleotide_base() -> None:
+    with pytest.raises(ValueError, match="unsupported dnaSequence base"):
+        featurize_protein_json(
+            {"sequences": [{"dnaSequence": {"sequence": "AX", "count": 1}}]}
+        )
 
 
 def test_featurize_json_rejects_smiles_ligand() -> None:

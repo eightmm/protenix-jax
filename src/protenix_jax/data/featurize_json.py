@@ -56,6 +56,14 @@ _PERIODIC_TABLE = (
 ELEMENT_INDEX = {elem: i for i, elem in enumerate(_PERIODIC_TABLE)}
 for _i in range(119, 129):
     ELEMENT_INDEX[f"UNK_ELEM_{_i}"] = _i - 1
+# Nucleotide restype indices (torch STD_RESIDUES); RNA then DNA.
+RNA_RESTYPE_INDEX = {"A": 21, "G": 22, "C": 23, "U": 24}
+DNA_RESTYPE_INDEX = {"DA": 26, "DG": 27, "DC": 28, "DT": 29}
+RNA_CODES = {"A": "A", "G": "G", "C": "C", "U": "U"}
+DNA_CODES = {"A": "DA", "G": "DG", "C": "DC", "T": "DT"}
+# Distogram representative atom: purine -> C4, pyrimidine -> C2.
+_PURINE_CODES = {"DA", "DG", "A", "G"}
+_PYRIMIDINE_CODES = {"DC", "DT", "C", "U"}
 AA1_TO_AA3 = {
     "A": "ALA", "R": "ARG", "N": "ASN", "D": "ASP", "C": "CYS",
     "Q": "GLN", "E": "GLU", "G": "GLY", "H": "HIS", "I": "ILE",
@@ -67,6 +75,8 @@ _CCD_TABLE_PATH = Path(__file__).with_name("ccd_std_residues.npz")
 _CCD_TABLE: dict[str, dict[str, np.ndarray]] | None = None
 _LIGAND_TABLE_PATH = Path(__file__).with_name("ccd_ligands.npz")
 _LIGAND_TABLE: dict[str, dict[str, np.ndarray]] | None = None
+_NUCLEIC_TABLE_PATH = Path(__file__).with_name("ccd_nucleotides.npz")
+_NUCLEIC_TABLE: dict[str, dict[str, np.ndarray]] | None = None
 
 
 def _ccd_ligands() -> dict[str, dict[str, np.ndarray]]:
@@ -92,6 +102,31 @@ def _ccd_ligands() -> dict[str, dict[str, np.ndarray]]:
             }
         _LIGAND_TABLE = table
     return _LIGAND_TABLE
+
+
+def _ccd_nucleotides() -> dict[str, dict[str, np.ndarray]]:
+    """Lazy-load the vendored nucleotide CCD reference table.
+
+    Each CCD code (DA/DC/DG/DT, A/C/G/U) maps to ``names``/``coord``/
+    ``charge``/``mask``/``elem`` arrays in RES_ATOMS order (OP3 first). OP3
+    is the 5'-terminal leaving atom: kept only for the first residue.
+    """
+
+    global _NUCLEIC_TABLE
+    if _NUCLEIC_TABLE is None:
+        raw = np.load(_NUCLEIC_TABLE_PATH, allow_pickle=False)
+        codes = [str(c) for c in raw["_codes"]]
+        table: dict[str, dict[str, np.ndarray]] = {}
+        for code in codes:
+            table[code] = {
+                "names": raw[f"{code}/names"],
+                "coord": raw[f"{code}/coord"].astype(np.float32),
+                "charge": raw[f"{code}/charge"].astype(np.float32),
+                "mask": raw[f"{code}/mask"].astype(np.float32),
+                "elem": raw[f"{code}/elem"],
+            }
+        _NUCLEIC_TABLE = table
+    return _NUCLEIC_TABLE
 
 
 def _ccd_std_residues() -> dict[str, dict[str, np.ndarray]]:
@@ -195,6 +230,8 @@ def featurize_protein_json(
     for chain in chains:
         if chain["kind"] == "protein":
             _emit_protein_tokens(chain, state)
+        elif chain["kind"] == "nucleic":
+            _emit_nucleic_tokens(chain, state)
         else:
             _emit_ligand_tokens(chain, state)
 
@@ -329,6 +366,8 @@ def _expand_chains(
             built = _build_protein_chain(
                 entry[kind], base_dir=base_dir, max_msa_rows=max_msa_rows
             )
+        elif kind in ("dnaSequence", "rnaSequence"):
+            built = _build_nucleic_chain(entry[kind], kind=kind)
         elif kind in ("ligand", "ion"):
             built = _build_ligand_chain(entry[kind], kind=kind)
         else:
@@ -434,9 +473,54 @@ def _build_ligand_chain(info: dict[str, Any], *, kind: str) -> dict[str, Any]:
     }
 
 
+def _build_nucleic_chain(
+    info: dict[str, Any], *, kind: str
+) -> dict[str, Any]:
+    """Build a DNA/RNA chain (one per-residue token like protein)."""
+
+    if not isinstance(info, dict):
+        raise ValueError(f"{kind} entry must be an object")
+    if info.get("modifications"):
+        raise ValueError(f"{kind} modifications are not supported")
+    sequence = info.get("sequence")
+    if not isinstance(sequence, str) or not sequence:
+        raise ValueError(f"{kind} sequence must be a non-empty string")
+    sequence = sequence.upper()
+    code_map = DNA_CODES if kind == "dnaSequence" else RNA_CODES
+    restype_map = DNA_RESTYPE_INDEX if kind == "dnaSequence" else RNA_RESTYPE_INDEX
+    table = _ccd_nucleotides()
+    codes = []
+    for base in sequence:
+        if base not in code_map:
+            raise ValueError(f"unsupported {kind} base: {base}")
+        codes.append(code_map[base])
+    count = int(info.get("count", 1))
+    if count <= 0:
+        raise ValueError(f"{kind} count must be positive")
+    label = "dna" if kind == "dnaSequence" else "rna"
+    n_tok = len(sequence)
+    gap = MSA_PROTEIN_INDEX["-"]
+    msa = np.full((1, n_tok), gap, dtype=np.int64)
+    deletion_matrix = np.zeros((1, n_tok), dtype=np.float32)
+    return {
+        "entity_key": f"{label}:{sequence}",
+        "count": count,
+        "chain": {
+            "kind": "nucleic",
+            "codes": codes,
+            "restype_map": restype_map,
+            "table": table,
+            "msa": msa,
+            "deletion_matrix": deletion_matrix,
+        },
+    }
+
+
 def _chain_token_count(chain: dict[str, Any]) -> int:
     if chain["kind"] == "protein":
         return len(chain["sequence"])
+    if chain["kind"] == "nucleic":
+        return len(chain["codes"])
     return sum(len(entry["names"]) for _res_id, entry in chain["residues"])
 
 
@@ -500,6 +584,42 @@ def _emit_ligand_tokens(
             state["ref_mask"].append(float(entry["mask"][j]))
             state["mol_id"].append(chain["asym_id"])
             state["token_i"] = token_i + 1
+
+
+def _emit_nucleic_tokens(
+    chain: dict[str, Any], state: dict[str, Any]
+) -> None:
+    """One token per nucleotide; OP3 kept only on the 5'-terminal residue."""
+
+    table = chain["table"]
+    restype_map = chain["restype_map"]
+    codes = chain["codes"]
+    for pos, code in enumerate(codes, start=1):
+        token_i = state["token_i"]
+        state["restype"][token_i, restype_map[code]] = 1.0
+        state["residue_index"][token_i] = pos
+        state["asym_id"][token_i] = chain["asym_id"]
+        state["entity_id"][token_i] = chain["entity_id"]
+        state["sym_id"][token_i] = chain["sym_id"]
+        entry = table[code]
+        names = entry["names"]
+        is_first = pos == 1
+        rep = "C4" if code in _PURINE_CODES else "C2"
+        for j, atom_name in enumerate(names):
+            atom_name = str(atom_name)
+            if atom_name == "OP3" and not is_first:
+                continue
+            state["atom_to_token_idx"].append(token_i)
+            state["atom_to_tokatom_idx"].append(j)
+            xyz = entry["coord"][j]
+            state["ref_pos"].append((float(xyz[0]), float(xyz[1]), float(xyz[2])))
+            state["ref_charge"].append(float(entry["charge"][j]))
+            state["ref_element"].append(str(entry["elem"][j]))
+            state["ref_atom_names"].append(atom_name)
+            state["distogram_rep_atom_mask"].append(int(atom_name == rep))
+            state["ref_mask"].append(float(entry["mask"][j]))
+            state["mol_id"].append(chain["asym_id"])
+        state["token_i"] = token_i + 1
 
 
 def _load_chain_msa_features(
