@@ -1168,11 +1168,23 @@ def load_torch_checkpoint(path: str | Path) -> ProtenixInferenceParams:
     (falling back to the raw object), strips a DistributedDataParallel
     ``module.`` prefix, then maps to ``ProtenixInferenceParams``. ``torch`` is
     imported lazily so the native runtime stays torch-free.
+
+    Security: ``path`` MUST be a trusted, locally-produced checkpoint. Loading
+    prefers the safe ``weights_only=True`` path (tensors + basic types only);
+    it only falls back to full unpickling for legacy checkpoints that bundle
+    non-tensor objects (optimizer/scheduler state), exactly as upstream
+    Protenix saves them. Never point this at an untrusted file.
     """
 
     import torch
 
-    obj = torch.load(str(path), map_location="cpu", weights_only=False)
+    try:
+        obj = torch.load(str(path), map_location="cpu", weights_only=True)
+    except Exception:
+        # Legacy Protenix checkpoints bundle optimizer/scheduler/step objects
+        # that the safe loader rejects; fall back to full unpickling. Trusted
+        # local file only (see docstring).
+        obj = torch.load(str(path), map_location="cpu", weights_only=False)
     if isinstance(obj, Mapping) and "model" in obj:
         state_dict = obj["model"]
     elif isinstance(obj, Mapping) and "state_dict" in obj:

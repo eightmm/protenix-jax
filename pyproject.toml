@@ -17,9 +17,10 @@ dependencies = [
 cuda12 = ["jax[cuda12]>=0.7.1"]
 cuda13 = ["jax[cuda13]>=0.7.1"]
 dev = ["pytest>=8.0.0", "ruff>=0.6.0"]
+torch-bridge = ["torch>=2.2"]
 
 [project.scripts]
-protenix-jax-featurize-json = "protenix_jax.featurize_json:main"
+protenix-jax-featurize-json = "protenix_jax.data.featurize_json:main"
 protenix-jax-predict = "protenix_jax.cli.predict:main"
 protenix-jax-static-infer = "protenix_jax.cli.static_infer:main"
 
