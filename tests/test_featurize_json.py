@@ -143,10 +143,20 @@ def test_featurize_json_emits_global_msa_rows(tmp_path) -> None:
 def test_featurize_json_rejects_unsupported_entities() -> None:
     job = {
         "name": "bad",
-        "sequences": [{"ligand": {"ligand": "CCD_ATP", "count": 1}}],
+        "sequences": [{"dnaSequence": {"sequence": "ACGT", "count": 1}}],
     }
 
-    with pytest.raises(ValueError, match="Only proteinChain"):
+    with pytest.raises(ValueError, match="unsupported entity kind"):
+        featurize_protein_json(job)
+
+
+def test_featurize_json_rejects_smiles_ligand() -> None:
+    job = {
+        "name": "bad",
+        "sequences": [{"ligand": {"ligand": "CCC=O", "count": 1}}],
+    }
+
+    with pytest.raises(ValueError, match="only CCD_"):
         featurize_protein_json(job)
 
 
@@ -203,3 +213,49 @@ def test_load_first_job_and_cli_write_static_npz(tmp_path) -> None:
     features = load_static_feature_npz(out_path)
     assert features["restype"].shape == (2, 32)
     assert features["pad_info"]["mask_trunked"].shape == features["v_lm"].shape[:-1]
+
+
+def test_featurize_protein_ligand_ion_complex() -> None:
+    job = {
+        "name": "complex",
+        "sequences": [
+            {"proteinChain": {"sequence": "GACE", "count": 1}},
+            {"ligand": {"ligand": "CCD_ATP", "count": 1}},
+            {"ion": {"ion": "MG", "count": 2}},
+        ],
+    }
+
+    features = featurize_protein_json(job)
+
+    # protein GACE tokens + ATP 31 atoms + 2 Mg = 4 + 31 + 2 = 37 tokens.
+    assert features["restype"].shape[0] == 37
+    n_atom = features["atom_to_token_idx"].shape[0]
+    assert features["ref_pos"].shape[0] == n_atom
+    assert features["ref_mask"].shape[0] == n_atom
+
+    # ligand/ion atoms are one token each (tokatom_idx == 0, distogram rep == 1).
+    lig_token_start = 4
+    lig_atom_mask = features["atom_to_token_idx"] >= lig_token_start
+    assert np.all(features["atom_to_tokatom_idx"][lig_atom_mask] == 0)
+    assert np.all(features["distogram_rep_atom_mask"][lig_atom_mask] == 1.0)
+
+    # ligand tokens are restype UNK (index 20).
+    assert np.all(features["restype"][lig_token_start:].argmax(-1) == 20)
+
+    # three distinct entities and four chains (1 protein, 1 ligand, 2 ions).
+    assert features["entity_id"].max() == 2
+    assert features["asym_id"].max() == 3
+    # two Mg ions share entity id but differ in sym id.
+    assert features["sym_id"].max() == 1
+
+
+def test_featurize_ion_residue_index() -> None:
+    job = {
+        "name": "ion",
+        "sequences": [{"ion": {"ion": "MG", "count": 1}}],
+    }
+
+    features = featurize_protein_json(job)
+    assert features["restype"].shape[0] == 1
+    assert features["residue_index"][0] == 1
+    assert features["ref_charge"][0] == 2.0
