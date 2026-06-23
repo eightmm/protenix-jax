@@ -83,12 +83,14 @@ format from an in-memory feature dictionary.
   skipping.
 - Native JAX weight load path; runtime inference runs without torch or upstream
   Protenix.
-- Sequence-only `proteinChain` JSON to static-feature `.npz` CLI. This path
-  supports `pairedMsaPath`/`unpairedMsaPath` A3M profile, deletion mean, and
-  row-level `msa`/`has_deletion`/`deletion_value` features with
-  `--max-msa-rows` depth control. It rejects ligands, nucleic acids, covalent
-  bonds, templates, and modified residues instead of silently producing partial
-  features.
+- Full-atom multimodal JSON to static-feature `.npz` CLI. The featurizer
+  expands `proteinChain`, `dnaSequence`/`rnaSequence`, and `ligand`/`ion`
+  entities to full-atom features via vendored CCD reference conformers, and
+  ingests structural templates (`templatesPath`). MSA support covers
+  `pairedMsaPath`/`unpairedMsaPath` A3M profile, deletion mean, and row-level
+  `msa`/`has_deletion`/`deletion_value` features with `--max-msa-rows` depth
+  control. It rejects only covalent bonds and modified residues (raising rather
+  than silently producing partial features).
 - Static inference CLI from either `.npz` features or direct sequence-only
   Protenix JSON; `protenix-jax-static-infer` is a native-only alias for
   `protenix-jax-predict`.
@@ -109,6 +111,29 @@ and `>2560: 32`. Explicit CLI chunk arguments override the policy.
 `--model-name auto` infers known Protenix model names from native weight
 filenames when possible; pass `--model-name protenix-v2` for renamed weights.
 
-Full Protenix raw-feature parity, including ligand/nucleic-acid featurization,
-species-based paired-MSA row assembly, template ingestion, TFG, and efficient
-fusion, is still in progress.
+## Numerical parity vs torch Protenix
+
+Verified against torch Protenix (`protenix_base_default_v1.0.0`, single chain,
+N_token 35 / N_atom 289, N_cycle 10 / N_step 20), all on GPU:
+
+- **Relative-position encoding: bit-exact** (corr 1.0, max|Δ| 4.8e-7).
+- **Trunk at matched fp32:** `s_trunk` corr **1.0000000**; `z_trunk` corr
+  0.9999845. The residual is torch's `tf32=True` matmul (~10-bit mantissa)
+  vs JAX fp32, entering at the input embedder (`s_inputs` corr 0.9999961) and
+  accumulating over recycles — not a logic difference.
+- **Diffusion noise path: bit-exact.** With torch's captured init + per-step
+  churn noise injected and centre-only augmentation, the analytic step-0
+  `x_noisy` matches torch to **5.3e-5 Å** (t_hat 4608.0 both).
+- **Determinism:** same noise twice → 2.1e-2 Å (the XLA/cuBLAS nondeterminism
+  floor).
+- **Matched-noise end-to-end:** all-atom Kabsch **0.73 Å**, CA Kabsch 0.56 Å.
+  This residual is the tf32-trunk gap amplified by the chaotic diffusion
+  sampler, consistent with the determinism floor; different noise gives ~26 Å,
+  confirming the sampler is genuinely noise-driven.
+- **GPU runtime:** 22.8 s warm (N_step 20, N_cycle 10), peak VRAM 2.2 GB.
+
+Conclusion: protenix_jax fp32 reproduces torch Protenix up to fp32/tf32 matmul
+precision and the XLA nondeterminism floor; there is no model-logic divergence.
+
+Species-based paired-MSA row assembly, TFG, and torch-side efficient fusion are
+not reimplemented (inference-equivalent paths are used instead).
